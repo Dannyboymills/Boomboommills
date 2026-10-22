@@ -125,6 +125,7 @@ body.land .card h1{font-size:40px}
 .joinrow{display:flex;gap:8px}.joinrow .inp{flex:1;min-width:0;font-family:var(--f-display);font-weight:400;font-size:22px;letter-spacing:.3em;text-transform:uppercase}
 .joinrow .go{flex:none;padding:0 24px;font-size:18px}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.or::before,.or::after{content:"";flex:1;height:1px;background:var(--line)}
+.card p.status{color:var(--green);font-weight:700;font-size:13px}.card p.status.bad{color:var(--yellow)}
 .card p.msg{color:var(--yellow);min-height:1.45em}
 .code{font-family:var(--f-display);font-size:clamp(48px,12vw,66px);letter-spacing:.18em;line-height:1;color:var(--hot);font-variant-numeric:tabular-nums}
 .places li.open{opacity:.5;font-weight:500}.places li.open i{border:1px dashed var(--muted)}
@@ -182,7 +183,8 @@ details .pgrid{margin-bottom:10px}
       </div>
 
       <div id="lobbyRoom" class="stack" hidden>
-        <div class="field"><span class="lbl">Room code</span><div class="code" id="roomCode">----</div><p id="roomHint"></p></div>
+        <div class="field"><span class="lbl">Room code</span><div class="code" id="roomCode">----</div><p id="roomHint"></p><p class="status" id="roomStatus"></p></div>
+        <button class="go alt" id="btnInvite" type="button" hidden>Send invite link</button>
         <ul class="places" id="lobbyList"></ul>
         <button class="go" id="btnStart" type="button" disabled>Waiting for players…</button>
         <p class="msg" id="waitMsg" hidden></p>
@@ -940,7 +942,10 @@ function updateReplay(dt){
 /* ---------- Round flow ---------- */
 let phase='menu',shakeAmt=0,overT=0,roundId=0,wakeLock=null;
 function keepAwake(){try{if(navigator.wakeLock&&!wakeLock)navigator.wakeLock.request('screen').then(l=>{wakeLock=l;l.addEventListener('release',()=>{wakeLock=null;});}).catch(()=>{});}catch(_){}}
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&phase!=='menu')keepAwake();});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState!=='visible')return;if(phase!=='menu')keepAwake();netWake();});
+function netWake(){const p=NET.peer;if(p&&!p.destroyed&&p.disconnected){try{p.reconnect();}catch(_){}}}
+setInterval(()=>{netWake();if(NET.role==='host'&&!$('lobbyRoom').hidden){const p=NET.peer,ok=p&&!p.destroyed&&!p.disconnected;
+  $('roomStatus').textContent=ok?'Room open: players can join':'Reconnecting your room…';$('roomStatus').classList.toggle('bad',!ok);}},1000);
 function clearWorld(){
   bombs.forEach(b=>scene.remove(b.mesh));flames.forEach(F=>{for(const k in F)scene.remove(F[k].mesh);});pups.forEach(P=>{for(const k in P)scene.remove(P[k].mesh);});
   debris.forEach(d=>d.mesh&&scene.remove(d.mesh));debris=[];ropes.forEach(r=>scene.remove(r.line));ropes=[];missiles.forEach(m=>scene.remove(m.mesh));missiles=[];puffs.forEach(p=>scene.remove(p.mesh));puffs=[];
@@ -1239,15 +1244,18 @@ function netJoin(code,name){
   netReset();NET.role='guest';NET.code=code;NET.opened=false;
   setMsg('Connecting…');busy(true);
   const peer=NET.peer=makePeer();
-  NET.timer=setTimeout(()=>{if(!NET.opened){netReset();showStart('Couldn’t connect. Check the code, and make sure the host has the game open on their screen.');}},20000);
-  peer.on('open',()=>{
+  // the host's room can drop off for a moment (e.g. they switched to WhatsApp), so keep trying
+  const tryConnect=()=>{if(NET.peer!==peer||NET.opened||peer.destroyed)return;
     const conn=NET.conn=peer.connect(PREFIX+code,{reliable:true,serialization:'json'});
-    conn.on('open',()=>{NET.opened=true;clearTimeout(NET.timer);busy(false);netSend(conn,{t:'hello',name});showRoom();});
-    conn.on('data',onGuestData);
-    conn.on('close',()=>netLost());conn.on('error',()=>netLost());});
+    conn.on('open',()=>{if(NET.conn!==conn)return;NET.opened=true;clearTimeout(NET.timer);busy(false);netSend(conn,{t:'hello',name});showRoom();});
+    conn.on('data',d=>{if(NET.conn===conn)onGuestData(d);});
+    const lost=()=>{if(NET.conn===conn&&NET.opened)netLost();};conn.on('close',lost);conn.on('error',lost);};
+  NET.timer=setTimeout(()=>{if(!NET.opened&&NET.peer===peer){netReset();showStart(`Couldn’t find game ${code}. Check the code, and ask the host to keep the game open on their screen while you join.`);}},45000);
+  peer.on('open',tryConnect);
   peer.on('disconnected',()=>{try{if(!peer.destroyed)peer.reconnect();}catch(_){}});
-  peer.on('error',err=>{const t=err&&err.type;
-    if(t==='peer-unavailable'){netReset();showStart(`No game found with code ${code}. Check the code with the host.`);return;}
+  peer.on('error',err=>{if(NET.peer!==peer)return;const t=err&&err.type;
+    if(t==='peer-unavailable'&&!NET.opened){setMsg(`Looking for game ${code}… Ask the host to go back to the game screen.`);setTimeout(tryConnect,3000);return;}
+    if(t==='peer-unavailable'||t==='network'||t==='disconnected')return;
     if(!NET.opened){netReset();showStart(serverError(t));}});
 }
 function netSendPos(a){const p=ents[ME];if(!p||!NET.conn)return;
@@ -1319,7 +1327,8 @@ function showStart(msg){$('lobbyStart').hidden=false;$('lobbyRoom').hidden=true;
 function showRoom(){
   $('lobbyStart').hidden=true;$('lobbyRoom').hidden=false;$('roomCode').textContent=NET.code;
   const host=NET.role==='host';$('btnStart').hidden=!host;$('waitMsg').hidden=host;
-  $('roomHint').textContent=host?'Your brothers open this game on their phones, tap Join and type this code.':'You’re in. The host starts the game.';
+  $('roomHint').textContent=host?'Send your brothers the invite link or this code, then come straight back here. They can only join while this screen is open.':'You’re in. The host starts the game.';
+  $('btnInvite').hidden=!host;$('roomStatus').hidden=!host;
 }
 function renderLobby(list,you,live){
   const rows=[];for(let i=0;i<3;i++){const p=list[i];
@@ -1339,6 +1348,10 @@ function doJoin(){sfx.init();const code=$('inCode').value.toUpperCase().replace(
 $('btnJoin').addEventListener('click',doJoin);
 $('inCode').addEventListener('keydown',e=>{if(e.key==='Enter')doJoin();});
 $('inCode').addEventListener('input',()=>{const v=$('inCode').value.toUpperCase().replace(/[^A-Z]/g,'').slice(0,4);if(v!==$('inCode').value)$('inCode').value=v;});
+function inviteUrl(){return location.origin+location.pathname+'#'+NET.code;}
+$('btnInvite').addEventListener('click',async()=>{const url=inviteUrl(),text=`Join my Blast Grid game! Code ${NET.code}`;
+  try{if(navigator.share){await navigator.share({title:'Blast Grid',text,url});return;}}catch(e){if(e&&e.name==='AbortError')return;}
+  try{await navigator.clipboard.writeText(text+' '+url);toast('Invite link copied');}catch(_){setMsg(url);}});
 $('btnLeave').addEventListener('click',()=>{netReset();showStart('');});
 $('btnQuit').addEventListener('click',()=>{netReset();backToMenu('');});
 // opening the link with #ABCD fills the code in
@@ -1354,7 +1367,7 @@ class FakeConn{constructor(p,peer,cid){this.p=p;this.peer=peer;this.cid=cid;this
   on(ev,f){(this.h[ev]=this.h[ev]||[]).push(f);}_emit(ev,...a){(this.h[ev]||[]).forEach(f=>f(...a));}
   send(d){if(!this.open)return;const msg={k:'data',from:this.p.id,to:this.peer,cid:this.cid,d:JSON.parse(JSON.stringify(d))};if(LAG)setTimeout(()=>this.p.post(msg),LAG);else this.p.post(msg);}
   close(){if(!this.open)return;this.open=false;this.p.post({k:'close',from:this.p.id,to:this.peer,cid:this.cid});this._emit('close');}}
-class FakePeer{constructor(id){this.id=id||'g'+Math.random().toString(36).slice(2,8);this.h={};this.conns={};this.destroyed=false;
+class FakePeer{constructor(id){this.id=id||'g'+Math.random().toString(36).slice(2,8);this.disconnected=false;this.h={};this.conns={};this.destroyed=false;
     this.bc=new BroadcastChannel('bg-fakepeer');this.bc.onmessage=e=>this._msg(e.data);setTimeout(()=>this._emit('open',this.id),30);}
   post(m){if(!this.destroyed)this.bc.postMessage(m);}
   on(ev,f){(this.h[ev]=this.h[ev]||[]).push(f);}_emit(ev,...a){(this.h[ev]||[]).forEach(f=>f(...a));}
